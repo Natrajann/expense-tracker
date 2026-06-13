@@ -1,0 +1,444 @@
+import { useState, useEffect } from "react";
+import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+
+const CATEGORIES = ["Food","Transport","Entertainment","Shopping","Health","Utilities","Subscriptions","Bills","Other"];
+const CAT_COLORS = ["#378ADD","#1D9E75","#D4537E","#EF9F27","#7F77DD","#D85A30","#639922","#E24B4A","#888780"];
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const FILE_NAME = "expense_tracker_data.json";
+
+function today() { return new Date().toISOString().split("T")[0]; }
+function fmt(n) { return "₹" + Number(n).toLocaleString("en-IN", {minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+async function callClaude(prompt) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system: `You are a Google Drive file manager assistant. You help read and write JSON data to Google Drive files. 
+Always respond with ONLY a valid JSON object, no markdown, no explanation.
+For read operations return: {"success": true, "data": <the parsed JSON content>, "fileId": "<id>"} or {"success": false, "error": "<reason>"}
+For write operations return: {"success": true, "fileId": "<id>"} or {"success": false, "error": "<reason>"}
+For search operations return: {"success": true, "files": [{"id":"...","name":"..."}]} or {"success": false, "error": "<reason>"}`,
+      messages: [{ role: "user", content: prompt }],
+      mcp_servers: [{ type: "url", url: "https://drivemcp.googleapis.com/mcp/v1", name: "google-drive" }]
+    })
+  });
+  const data = await res.json();
+  const text = data.content.filter(b => b.type === "text").map(b => b.text).join("");
+  try {
+    const clean = text.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  } catch { return { success: false, error: "Parse error: " + text }; }
+}
+
+async function loadFromDrive() {
+  const search = await callClaude(`Search for a file named exactly "${FILE_NAME}" in Google Drive. Return its id and name if found.`);
+  if (!search.success || !search.files || search.files.length === 0) return { expenses: [], renewals: [], fileId: null };
+  const fileId = search.files[0].id;
+  const read = await callClaude(`Read the full text content of the Google Drive file with id "${fileId}". Return the parsed JSON content.`);
+  if (!read.success) return { expenses: [], renewals: [], fileId };
+  return { ...(read.data || { expenses: [], renewals: [] }), fileId };
+}
+
+async function saveToDrive(fileId, expenses, renewals) {
+  const content = JSON.stringify({ expenses, renewals }, null, 2);
+  if (fileId) {
+    const res = await callClaude(`Update the Google Drive file with id "${fileId}" with this exact JSON content: ${content}. Return the fileId.`);
+    return res.success ? fileId : null;
+  } else {
+    const res = await callClaude(`Create a new file named "${FILE_NAME}" in Google Drive with this exact JSON content: ${content}. Return the fileId.`);
+    return res.success ? res.fileId : null;
+  }
+}
+
+export default function App() {
+  const [tab, setTab] = useState("dashboard");
+  const [expenses, setExpenses] = useState([]);
+  const [renewals, setRenewals] = useState([]);
+  const [fileId, setFileId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("Loaded from Google Drive");
+
+  const [eForm, setEForm] = useState({ amount:"", category:"Food", date:today(), note:"" });
+  const [rForm, setRForm] = useState({ name:"", amount:"", category:"Subscriptions", renewDate:"", frequency:"monthly", note:"" });
+  const [eEdit, setEEdit] = useState(null);
+  const [rEdit, setREdit] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const result = await loadFromDrive();
+        setExpenses(result.expenses || []);
+        setRenewals(result.renewals || []);
+        setFileId(result.fileId || null);
+        setSaveStatus(result.fileId ? "Loaded from Google Drive" : "New file — will save to Google Drive");
+      } catch (e) {
+        setSaveStatus("Could not load from Google Drive");
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  async function persist(newExpenses, newRenewals) {
+    setSaving(true);
+    setSaveStatus("Saving to Google Drive…");
+    try {
+      const newFileId = await saveToDrive(fileId, newExpenses, newRenewals);
+      if (newFileId) { setFileId(newFileId); setSaveStatus("Saved to Google Drive ✓"); }
+      else setSaveStatus("Save failed — please retry");
+    } catch { setSaveStatus("Save failed — please retry"); }
+    setSaving(false);
+  }
+
+  const dueRenewals = renewals.filter(r => {
+    const days = Math.ceil((new Date(r.renewDate) - new Date()) / 86400000);
+    return days <= 7 && days >= 0;
+  });
+
+  async function saveExpense() {
+    if (!eForm.amount || !eForm.date) return;
+    let updated;
+    if (eEdit !== null) {
+      updated = expenses.map((e,i) => i===eEdit ? {...eForm, id:e.id} : e);
+      setEEdit(null);
+    } else {
+      updated = [...expenses, {...eForm, id: Date.now()}];
+    }
+    setExpenses(updated);
+    await persist(updated, renewals);
+    setEForm({ amount:"", category:"Food", date:today(), note:"" });
+  }
+
+  async function saveRenewal() {
+    if (!rForm.name || !rForm.amount || !rForm.renewDate) return;
+    let updated;
+    if (rEdit !== null) {
+      updated = renewals.map((r,i) => i===rEdit ? {...rForm, id:r.id} : r);
+      setREdit(null);
+    } else {
+      updated = [...renewals, {...rForm, id: Date.now()}];
+    }
+    setRenewals(updated);
+    await persist(expenses, updated);
+    setRForm({ name:"", amount:"", category:"Subscriptions", renewDate:"", frequency:"monthly", note:"" });
+  }
+
+  async function delExpense(id) {
+    const updated = expenses.filter(e=>e.id!==id);
+    setExpenses(updated);
+    await persist(updated, renewals);
+  }
+
+  async function delRenewal(id) {
+    const updated = renewals.filter(r=>r.id!==id);
+    setRenewals(updated);
+    await persist(expenses, updated);
+  }
+
+  function editExpense(i) { setEEdit(i); setEForm({...expenses[i]}); setTab("expenses"); }
+  function editRenewal(i) { setREdit(i); setRForm({...renewals[i]}); setTab("renewals"); }
+
+  function exportCSV() {
+    const rows = [["Date","Category","Amount","Note","Type"]];
+    expenses.forEach(e => rows.push([e.date, e.category, e.amount, e.note||"", "Expense"]));
+    renewals.forEach(r => rows.push([r.renewDate, r.category, r.amount, r.note||"", `Renewal: ${r.name}`]));
+    const csv = rows.map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+    a.download = "expenses.csv"; a.click();
+  }
+
+  const now = new Date();
+  const thisMonth = expenses.filter(e => {
+    const d = new Date(e.date);
+    return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear();
+  });
+  const lastMonth = expenses.filter(e => {
+    const d = new Date(e.date);
+    const lm = new Date(now.getFullYear(), now.getMonth()-1, 1);
+    return d.getMonth()===lm.getMonth() && d.getFullYear()===lm.getFullYear();
+  });
+  const totalThis = thisMonth.reduce((s,e)=>s+Number(e.amount),0);
+  const totalLast = lastMonth.reduce((s,e)=>s+Number(e.amount),0);
+
+  const catData = CATEGORIES.map((c,i) => ({
+    name:c, value: thisMonth.filter(e=>e.category===c).reduce((s,e)=>s+Number(e.amount),0), color:CAT_COLORS[i]
+  })).filter(d=>d.value>0);
+
+  const monthData = Array.from({length:6},(_,i)=>{
+    const d = new Date(now.getFullYear(), now.getMonth()-5+i, 1);
+    const total = expenses.filter(e=>{
+      const ed=new Date(e.date);
+      return ed.getMonth()===d.getMonth()&&ed.getFullYear()===d.getFullYear();
+    }).reduce((s,e)=>s+Number(e.amount),0);
+    return { month: MONTHS[d.getMonth()], total: Math.round(total) };
+  });
+
+  const inp = {border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",padding:"6px 10px",fontSize:"14px",background:"var(--color-background-primary)",color:"var(--color-text-primary)",width:"100%",boxSizing:"border-box"};
+  const tabs = [
+    {id:"dashboard",label:"Dashboard"},
+    {id:"expenses",label:"Expenses"},
+    {id:"renewals",label:"Renewals"},
+    {id:"reminders",label:`Reminders${dueRenewals.length>0?" ("+dueRenewals.length+")":""}` },
+  ];
+
+  if (loading) return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:220,gap:12}}>
+      <svg width="32" height="32" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
+        <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>
+        <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44a9.06 9.06 0 0 0 -1.2 4.5h27.5z" fill="#00ac47"/>
+        <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/>
+        <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/>
+        <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/>
+        <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 27h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/>
+      </svg>
+      <p style={{fontSize:14,color:"var(--color-text-secondary)",margin:0}}>Loading from Google Drive…</p>
+    </div>
+  );
+
+  return (
+    <div style={{fontFamily:"var(--font-sans)",maxWidth:700,margin:"0 auto",padding:"1rem 0"}}>
+      <h2 className="sr-only">Personal Expense Tracker</h2>
+
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1.25rem"}}>
+        <div>
+          <p style={{fontSize:20,fontWeight:500,margin:0,color:"var(--color-text-primary)"}}>Expense Tracker</p>
+          <p style={{fontSize:12,color: saving ? "var(--color-text-warning)" : saveStatus.includes("✓") ? "var(--color-text-success)" : "var(--color-text-secondary)",margin:"2px 0 0"}}>
+            {saveStatus}
+          </p>
+        </div>
+        <button onClick={exportCSV} style={{border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",padding:"7px 16px",fontSize:13,cursor:"pointer",background:"var(--color-background-secondary)",color:"var(--color-text-primary)"}}>
+          Export CSV
+        </button>
+      </div>
+
+      {dueRenewals.length>0 && (
+        <div style={{background:"var(--color-background-warning)",border:"0.5px solid var(--color-border-warning)",borderRadius:"var(--border-radius-md)",padding:"10px 14px",marginBottom:"1rem",fontSize:13,color:"var(--color-text-warning)"}}>
+          ⚠ {dueRenewals.length} renewal{dueRenewals.length>1?"s":""} due within 7 days: {dueRenewals.map(r=>r.name).join(", ")}
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:6,marginBottom:"1.5rem",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{
+            background:"none",border:"none",cursor:"pointer",padding:"8px 14px",fontSize:13,
+            color: tab===t.id ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+            borderBottom: tab===t.id ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+            fontWeight: tab===t.id ? 500 : 400, marginBottom:-1
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {tab==="dashboard" && (
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:"1.5rem"}}>
+            {[
+              {label:"This month",val:fmt(totalThis)},
+              {label:"Last month",val:fmt(totalLast)},
+              {label:"Expenses",val:expenses.length},
+              {label:"Renewals",val:renewals.length},
+            ].map(c=>(
+              <div key={c.label} style={{background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",padding:"1rem",textAlign:"center"}}>
+                <p style={{fontSize:12,color:"var(--color-text-secondary)",margin:"0 0 4px"}}>{c.label}</p>
+                <p style={{fontSize:20,fontWeight:500,margin:0,color:"var(--color-text-primary)"}}>{c.val}</p>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:"1.5rem"}}>
+            <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+              <p style={{fontSize:13,fontWeight:500,margin:"0 0 12px",color:"var(--color-text-primary)"}}>This month by category</p>
+              {catData.length===0 ? <p style={{fontSize:12,color:"var(--color-text-secondary)"}}>No data yet</p> : (
+                <ResponsiveContainer width="100%" height={180}>
+                  <PieChart><Pie data={catData} dataKey="value" cx="50%" cy="50%" outerRadius={70} paddingAngle={2}>
+                    {catData.map((d,i)=><Cell key={i} fill={d.color}/>)}
+                  </Pie><Tooltip formatter={v=>fmt(v)}/></PieChart>
+                </ResponsiveContainer>
+              )}
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:8}}>
+                {catData.map((d,i)=>(
+                  <span key={i} style={{fontSize:11,display:"flex",alignItems:"center",gap:3,color:"var(--color-text-secondary)"}}>
+                    <span style={{width:8,height:8,borderRadius:2,background:d.color,display:"inline-block"}}></span>{d.name}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+              <p style={{fontSize:13,fontWeight:500,margin:"0 0 12px",color:"var(--color-text-primary)"}}>Monthly trend (6 months)</p>
+              <ResponsiveContainer width="100%" height={180}>
+                <BarChart data={monthData}>
+                  <XAxis dataKey="month" tick={{fontSize:11,fill:"var(--color-text-secondary)"}} axisLine={false} tickLine={false}/>
+                  <YAxis tick={{fontSize:11,fill:"var(--color-text-secondary)"}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}`}/>
+                  <Tooltip formatter={v=>fmt(v)}/>
+                  <Bar dataKey="total" fill="#378ADD" radius={[3,3,0,0]}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 10px",color:"var(--color-text-primary)"}}>Recent expenses</p>
+            {expenses.length===0 ? <p style={{fontSize:13,color:"var(--color-text-secondary)"}}>No expenses yet</p> :
+              [...expenses].reverse().slice(0,5).map(e=>(
+                <div key={e.id} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                  <div>
+                    <span style={{fontSize:13,color:"var(--color-text-primary)"}}>{e.category}</span>
+                    {e.note && <span style={{fontSize:12,color:"var(--color-text-secondary)",marginLeft:6}}>{e.note}</span>}
+                  </div>
+                  <div style={{display:"flex",gap:12,alignItems:"center"}}>
+                    <span style={{fontSize:12,color:"var(--color-text-secondary)"}}>{e.date}</span>
+                    <span style={{fontSize:13,fontWeight:500,color:"var(--color-text-primary)"}}>{fmt(e.amount)}</span>
+                  </div>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      )}
+
+      {tab==="expenses" && (
+        <div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem",marginBottom:"1.25rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 12px",color:"var(--color-text-primary)"}}>{eEdit!==null?"Edit expense":"Add expense"}</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <input style={inp} placeholder="Amount (₹)" type="number" value={eForm.amount} onChange={e=>setEForm({...eForm,amount:e.target.value})}/>
+              <select style={inp} value={eForm.category} onChange={e=>setEForm({...eForm,category:e.target.value})}>
+                {CATEGORIES.map(c=><option key={c}>{c}</option>)}
+              </select>
+              <input style={inp} type="date" value={eForm.date} onChange={e=>setEForm({...eForm,date:e.target.value})}/>
+              <input style={inp} placeholder="Note (optional)" value={eForm.note} onChange={e=>setEForm({...eForm,note:e.target.value})}/>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={saveExpense} disabled={saving} style={{background:"var(--color-text-primary)",color:"var(--color-background-primary)",border:"none",borderRadius:"var(--border-radius-md)",padding:"7px 18px",fontSize:13,cursor:"pointer",opacity:saving?0.6:1}}>
+                {saving?"Saving…":eEdit!==null?"Update":"Add"}
+              </button>
+              {eEdit!==null && <button onClick={()=>{setEEdit(null);setEForm({amount:"",category:"Food",date:today(),note:""}); }} style={{border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",padding:"7px 18px",fontSize:13,cursor:"pointer",background:"var(--color-background-secondary)",color:"var(--color-text-secondary)"}}>Cancel</button>}
+            </div>
+          </div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 10px",color:"var(--color-text-primary)"}}>All expenses ({expenses.length})</p>
+            {expenses.length===0 ? <p style={{fontSize:13,color:"var(--color-text-secondary)"}}>No expenses yet. Add one above!</p> :
+              [...expenses].reverse().map((e,i)=>{
+                const ri = expenses.length-1-i;
+                return (
+                  <div key={e.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                    <div>
+                      <span style={{fontSize:13,fontWeight:500,color:"var(--color-text-primary)"}}>{e.category}</span>
+                      {e.note && <span style={{fontSize:12,color:"var(--color-text-secondary)",marginLeft:6}}>{e.note}</span>}
+                      <br/><span style={{fontSize:11,color:"var(--color-text-secondary)"}}>{e.date}</span>
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      <span style={{fontSize:14,fontWeight:500,color:"var(--color-text-primary)"}}>{fmt(e.amount)}</span>
+                      <button onClick={()=>editExpense(ri)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--color-text-secondary)",fontSize:13,padding:"2px 6px"}}>Edit</button>
+                      <button onClick={()=>delExpense(e.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--color-text-danger)",fontSize:13,padding:"2px 6px"}}>Delete</button>
+                    </div>
+                  </div>
+                );
+              })
+            }
+          </div>
+        </div>
+      )}
+
+      {tab==="renewals" && (
+        <div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem",marginBottom:"1.25rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 12px",color:"var(--color-text-primary)"}}>{rEdit!==null?"Edit renewal":"Add renewal / subscription"}</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <input style={inp} placeholder="Name (e.g. Netflix)" value={rForm.name} onChange={e=>setRForm({...rForm,name:e.target.value})}/>
+              <input style={inp} placeholder="Amount (₹)" type="number" value={rForm.amount} onChange={e=>setRForm({...rForm,amount:e.target.value})}/>
+              <select style={inp} value={rForm.category} onChange={e=>setRForm({...rForm,category:e.target.value})}>
+                {CATEGORIES.map(c=><option key={c}>{c}</option>)}
+              </select>
+              <select style={inp} value={rForm.frequency} onChange={e=>setRForm({...rForm,frequency:e.target.value})}>
+                {["weekly","monthly","quarterly","yearly"].map(f=><option key={f}>{f}</option>)}
+              </select>
+              <input style={inp} type="date" value={rForm.renewDate} onChange={e=>setRForm({...rForm,renewDate:e.target.value})}/>
+              <input style={inp} placeholder="Note (optional)" value={rForm.note} onChange={e=>setRForm({...rForm,note:e.target.value})}/>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={saveRenewal} disabled={saving} style={{background:"var(--color-text-primary)",color:"var(--color-background-primary)",border:"none",borderRadius:"var(--border-radius-md)",padding:"7px 18px",fontSize:13,cursor:"pointer",opacity:saving?0.6:1}}>
+                {saving?"Saving…":rEdit!==null?"Update":"Add"}
+              </button>
+              {rEdit!==null && <button onClick={()=>{setREdit(null);setRForm({name:"",amount:"",category:"Subscriptions",renewDate:"",frequency:"monthly",note:""});}} style={{border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",padding:"7px 18px",fontSize:13,cursor:"pointer",background:"var(--color-background-secondary)",color:"var(--color-text-secondary)"}}>Cancel</button>}
+            </div>
+          </div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 10px",color:"var(--color-text-primary)"}}>All renewals ({renewals.length})</p>
+            {renewals.length===0 ? <p style={{fontSize:13,color:"var(--color-text-secondary)"}}>No renewals yet. Add one above!</p> :
+              [...renewals].sort((a,b)=>new Date(a.renewDate)-new Date(b.renewDate)).map(r=>{
+                const ri = renewals.findIndex(x=>x.id===r.id);
+                const days = Math.ceil((new Date(r.renewDate)-new Date())/86400000);
+                const urgent = days>=0&&days<=7;
+                return (
+                  <div key={r.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                    <div>
+                      <span style={{fontSize:13,fontWeight:500,color:"var(--color-text-primary)"}}>{r.name}</span>
+                      <span style={{fontSize:11,color:"var(--color-text-secondary)",marginLeft:6}}>{r.category} · {r.frequency}</span>
+                      <br/>
+                      <span style={{fontSize:11,color:urgent?"var(--color-text-warning)":"var(--color-text-secondary)"}}>
+                        Renews: {r.renewDate} {days>=0?`(${days}d away)`:days<0?"(overdue)":""}
+                      </span>
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      <span style={{fontSize:14,fontWeight:500,color:"var(--color-text-primary)"}}>{fmt(r.amount)}</span>
+                      <button onClick={()=>editRenewal(ri)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--color-text-secondary)",fontSize:13,padding:"2px 6px"}}>Edit</button>
+                      <button onClick={()=>delRenewal(r.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--color-text-danger)",fontSize:13,padding:"2px 6px"}}>Delete</button>
+                    </div>
+                  </div>
+                );
+              })
+            }
+          </div>
+        </div>
+      )}
+
+      {tab==="reminders" && (
+        <div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem",marginBottom:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 10px",color:"var(--color-text-primary)"}}>Due within 7 days</p>
+            {dueRenewals.length===0 ? <p style={{fontSize:13,color:"var(--color-text-secondary)"}}>No upcoming renewals in the next 7 days.</p> :
+              dueRenewals.sort((a,b)=>new Date(a.renewDate)-new Date(b.renewDate)).map(r=>{
+                const days = Math.ceil((new Date(r.renewDate)-new Date())/86400000);
+                return (
+                  <div key={r.id} style={{background:"var(--color-background-warning)",border:"0.5px solid var(--color-border-warning)",borderRadius:"var(--border-radius-md)",padding:"10px 14px",marginBottom:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div>
+                        <p style={{margin:0,fontSize:13,fontWeight:500,color:"var(--color-text-warning)"}}>{r.name}</p>
+                        <p style={{margin:"2px 0 0",fontSize:12,color:"var(--color-text-warning)"}}>{r.category} · {r.frequency} · due {r.renewDate} ({days===0?"today":`${days}d`})</p>
+                      </div>
+                      <p style={{margin:0,fontSize:14,fontWeight:500,color:"var(--color-text-warning)"}}>{fmt(r.amount)}</p>
+                    </div>
+                  </div>
+                );
+              })
+            }
+          </div>
+          <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"1rem"}}>
+            <p style={{fontSize:13,fontWeight:500,margin:"0 0 10px",color:"var(--color-text-primary)"}}>All upcoming renewals</p>
+            {renewals.filter(r=>new Date(r.renewDate)>=new Date()).length===0 ?
+              <p style={{fontSize:13,color:"var(--color-text-secondary)"}}>No upcoming renewals.</p> :
+              renewals.filter(r=>new Date(r.renewDate)>=new Date())
+                .sort((a,b)=>new Date(a.renewDate)-new Date(b.renewDate))
+                .map(r=>{
+                  const days = Math.ceil((new Date(r.renewDate)-new Date())/86400000);
+                  return (
+                    <div key={r.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                      <div>
+                        <span style={{fontSize:13,fontWeight:500,color:"var(--color-text-primary)"}}>{r.name}</span>
+                        <span style={{fontSize:11,color:"var(--color-text-secondary)",marginLeft:6}}>{r.frequency}</span>
+                        <br/><span style={{fontSize:11,color:"var(--color-text-secondary)"}}>{r.renewDate} · {days}d away</span>
+                      </div>
+                      <span style={{fontSize:14,fontWeight:500,color:"var(--color-text-primary)"}}>{fmt(r.amount)}</span>
+                    </div>
+                  );
+                })
+            }
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
